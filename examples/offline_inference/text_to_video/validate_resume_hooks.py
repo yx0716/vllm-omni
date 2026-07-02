@@ -53,6 +53,7 @@ def parse_args():
     p.add_argument("--enable-layerwise-offload", action="store_true")
     p.add_argument("--enforce-eager", action="store_true", default=True)
     p.add_argument("--out-dir", default="/tmp/wan22-resume-validation")
+    p.add_argument("--init-timeout", type=int, default=1800, help="Engine/stage init timeout (s)")
     return p.parse_args()
 
 
@@ -110,6 +111,10 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         enable_layerwise_offload=args.enable_layerwise_offload,
         flow_shift=args.flow_shift,
+        # Cold-loading 2x14B from shared storage can exceed the 600s/300s
+        # defaults on the first run; be generous.
+        init_timeout=args.init_timeout,
+        stage_init_timeout=args.init_timeout,
     )
 
     prompt_dict = {"prompt": args.prompt}
