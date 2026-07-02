@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, cast
 
 import PIL.Image
@@ -454,6 +454,8 @@ class Wan22Pipeline(
         attention_kwargs: dict[str, Any],
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -536,6 +538,18 @@ class Wan22Pipeline(
                 )
 
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                # Same per-step hook shape as FluxKontext: invoked after the
+                # scheduler step with the post-step latents.
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, step_idx, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
                 pbar.update()
 
         return latents
@@ -555,6 +569,8 @@ class Wan22Pipeline(
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         **kwargs,
     ) -> DiffusionOutput:
         # Get parameters from request or arguments
@@ -780,6 +796,30 @@ class Wan22Pipeline(
         if attention_kwargs is None:
             attention_kwargs = {}
 
+        # Optionally record the post-step latent trajectory through the per-step
+        # callback and return it via DiffusionOutput (same contract as bagel's
+        # return_trajectory_latents). Recording keeps one latent per step alive
+        # on device until the run completes.
+        trajectory_latents: list[torch.Tensor] | None = None
+        trajectory_timesteps: list[torch.Tensor] | None = None
+        if req.sampling_params.return_trajectory_latents:
+            trajectory_latents = []
+            trajectory_timesteps = []
+            if "latents" not in callback_on_step_end_tensor_inputs:
+                callback_on_step_end_tensor_inputs = [*callback_on_step_end_tensor_inputs, "latents"]
+            user_callback_on_step_end = callback_on_step_end
+
+            def _record_trajectory(pipe, step_idx, t, callback_kwargs):
+                callback_outputs = {}
+                if user_callback_on_step_end is not None:
+                    callback_outputs = user_callback_on_step_end(pipe, step_idx, t, callback_kwargs) or {}
+                stepped_latents = callback_outputs.get("latents", callback_kwargs["latents"])
+                trajectory_latents.append(stepped_latents.clone())
+                trajectory_timesteps.append(t.detach().clone() if isinstance(t, torch.Tensor) else torch.tensor(t))
+                return callback_outputs
+
+            callback_on_step_end = _record_trajectory
+
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
         latents = self.diffuse(
@@ -794,6 +834,8 @@ class Wan22Pipeline(
             attention_kwargs=attention_kwargs,
             latent_condition=latent_condition,
             first_frame_mask=first_frame_mask,
+            callback_on_step_end=callback_on_step_end,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
@@ -848,8 +890,17 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
+        trajectory_latents_stacked: torch.Tensor | None = None
+        trajectory_timesteps_stacked: torch.Tensor | None = None
+        if trajectory_latents:
+            trajectory_latents_stacked = torch.stack(trajectory_latents)
+            trajectory_timesteps_stacked = torch.stack(trajectory_timesteps)
+
         return DiffusionOutput(
-            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            output=output,
+            trajectory_latents=trajectory_latents_stacked,
+            trajectory_timesteps=trajectory_timesteps_stacked,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     def predict_noise(
