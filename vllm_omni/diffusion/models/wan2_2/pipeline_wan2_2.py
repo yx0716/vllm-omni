@@ -676,6 +676,25 @@ class Wan22Pipeline(
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
+
+        # strength < 1.0 resumes denoising from an intermediate timestep. The caller
+        # must provide ``sampling_params.latents`` carrying the diffusion state at
+        # that timestep (e.g. an intermediate latent checkpointed from a previous
+        # run, or an img2img-style edit source that was noised accordingly).
+        strength = req.sampling_params.strength
+        if strength is not None:
+            if req.sampling_params.latents is None:
+                logger.warning(
+                    "strength (%.2f) requires caller-provided latents that already match "
+                    "the resumed noise level. Ignoring strength and running the full schedule.",
+                    strength,
+                )
+                strength = None
+            elif not 0.0 <= strength <= 1.0:
+                raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
+        if strength is not None:
+            timesteps, num_steps = self.get_timesteps(num_steps, strength, device)
+
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:
@@ -973,6 +992,23 @@ class Wan22Pipeline(
             raise ValueError(f"Generator list length {len(generator)} does not match batch size {batch_size}.")
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
+
+    def get_timesteps(
+        self,
+        num_inference_steps: int,
+        strength: float,
+        device: torch.device | str | None,
+    ) -> tuple[torch.Tensor, int]:
+        # Same schedule-slicing scheme as the Z-Image I2I pipeline: keep the last
+        # ``strength * num_inference_steps`` steps and tell the scheduler where the
+        # run resumes so multistep solvers (UniPC) stay aligned with the slice.
+        init_timestep = min(num_inference_steps * strength, num_inference_steps)
+        t_start = int(max(num_inference_steps - init_timestep, 0))
+        scheduler_order = getattr(self.scheduler, "order", 1)
+        timesteps = self.scheduler.timesteps[t_start * scheduler_order :]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start * scheduler_order)
+        return timesteps, num_inference_steps - t_start
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""
